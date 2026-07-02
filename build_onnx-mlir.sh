@@ -88,34 +88,24 @@ if [[ -z "$pythonLocation" ]]; then
   # Standard virtual environment configuration
   # ----------------------------------------------------------
 
+  # Use system C++ compiler.
+  # Build optimized Release binaries.
+  # Additional package search path for LLVM/MLIR.
+  # Enable LLVM runtime assertions.
+  # Limit parallel linker jobs to reduce RAM usage.
+  # MLIR installation path.
+  # LLVM installation path.
+  # Python interpreter from active virtual environment.
   cmake -G Ninja \
-
-        # Use system C++ compiler.
-        -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
-
-        # Build optimized Release binaries.
-        -DCMAKE_BUILD_TYPE=Release \
-
-        # Additional package search path for LLVM/MLIR.
-        -DCMAKE_PREFIX_PATH=/home/laura/onnx-mlir/llvm-project/build \
-
-        # Enable LLVM runtime assertions.
-        # Useful for debugging compiler/runtime issues.
-        -DLLVM_ENABLE_ASSERTIONS=ON \
-
-        # Limit parallel linker jobs to reduce RAM usage.
-        -DLLVM_PARALLEL_LINK_JOBS=1 \
-
-        # MLIR installation path.
-        -DMLIR_DIR=${MLIR_DIR} \
-
-        # LLVM installation path.
-        -DLLVM_DIR=${LLVM_DIR} \
-
-        # Python interpreter from active virtual environment.
-        -DPython3_EXECUTABLE=$VIRTUAL_ENV/bin/python \
-
-        ..
+    -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH=/home/laura/onnx-mlir/llvm-project/build \
+    -DLLVM_ENABLE_ASSERTIONS=ON \
+    -DLLVM_PARALLEL_LINK_JOBS=1 \
+    -DMLIR_DIR="${MLIR_DIR}" \
+    -DLLVM_DIR="${LLVM_DIR}" \
+    -DPython3_EXECUTABLE="$VIRTUAL_ENV/bin/python" \
+    ..
 
 else
 
@@ -123,39 +113,28 @@ else
   # Custom Python installation configuration
   # ----------------------------------------------------------
 
+  # Use system C++ compiler.
+  # Build optimized Release binaries.
+  # Additional LLVM package search path.
+  # Enable LLVM assertions.
+  # Restrict linker parallelism.
+  # Root directory for custom Python installation.
+  # MLIR CMake package path.
+  # LLVM CMake package path.
+  # Python executable from active virtual environment.
   cmake -G Ninja \
-
-        # Use system C++ compiler.
-        -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
-
-        # Build optimized Release binaries.
-        -DCMAKE_BUILD_TYPE=Release \
-
-        # Additional LLVM package search path.
-        -DCMAKE_PREFIX_PATH=/home/laura/onnx-mlir/llvm-project/build \
-
-        # Enable LLVM assertions.
-        -DLLVM_ENABLE_ASSERTIONS=ON \
-
-        # Restrict linker parallelism.
-        -DLLVM_PARALLEL_LINK_JOBS=1 \
-
-        # Root directory for custom Python installation.
-        -DPython3_ROOT_DIR=$pythonLocation \
-
-        # MLIR CMake package path.
-        -DMLIR_DIR=${MLIR_DIR} \
-
-        # LLVM CMake package path.
-        -DLLVM_DIR=${LLVM_DIR} \
-
-        # Python executable from active virtual environment.
-        -DPython3_EXECUTABLE=$VIRTUAL_ENV/bin/python \
-
-        ..
+    -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH=/home/laura/onnx-mlir/llvm-project/build \
+    -DLLVM_ENABLE_ASSERTIONS=ON \
+    -DLLVM_PARALLEL_LINK_JOBS=1 \
+    -DPython3_ROOT_DIR="$pythonLocation" \
+    -DMLIR_DIR="${MLIR_DIR}" \
+    -DLLVM_DIR="${LLVM_DIR}" \
+    -DPython3_EXECUTABLE="$VIRTUAL_ENV/bin/python" \
+    ..
 
 fi
-
 # ============================================================
 # Build Configuration
 # ============================================================
