@@ -46,13 +46,31 @@ LOOP_DECL_RE = re.compile(
 
 
 def find_loop_results(lines):
-    """Map SSA result name -> 1-indexed declaration line number, for every
-    affine.for/scf.for that produces a single f32 result."""
-    result = {}
+    """Return a list of (result_name, declaring_loop_line, body_end_idx) for
+    every affine.for/scf.for that produces a single f32 result. Tracks each
+    loop's own body-end index (via brace depth) rather than a simple
+    name->line dict, since result names like %106 are commonly reused
+    across many structurally-unrelated loops (e.g. every conv layer's own
+    reduction loop) -- a name-only mapping would let a later declaration
+    silently overwrite an earlier one, misattributing every matching cast
+    in the file to whichever loop happened to be declared last."""
+    depths = []
+    depth = 0
+    for line in lines:
+        depth += line.count("{") - line.count("}")
+        depths.append(depth)
+
+    result = []  # list of (result_name, loop_line, body_end_idx)
     for i, line in enumerate(lines):
         m = LOOP_DECL_RE.match(line)
         if m:
-            result[m.group("result")] = i + 1
+            base_depth = depths[i]
+            body_end = len(lines)
+            for j in range(i + 1, len(lines)):
+                if depths[j] < base_depth:
+                    body_end = j
+                    break
+            result.append((m.group("result"), i + 1, body_end))
     return result
 
 
@@ -86,13 +104,29 @@ def find_problematic_casts(lines, loop_results):
     """
     Return a list of (cast_line_no, declaring_loop_line_no, cast_match)
     for every unrealized_conversion_cast whose operand is a loop's own
-    result -- the structurally problematic pattern.
+    result -- the structurally problematic pattern. For each cast, matches
+    against the loop (among possibly several sharing the same result name
+    in unrelated scopes) whose body ends nearest to, and at or before, the
+    cast's own line -- since a loop's result is only ever used starting
+    immediately after its own closing brace, this correctly disambiguates
+    same-named results from different loops.
     """
     found = []
     for i, line in enumerate(lines):
         m = CAST_RE.match(line)
-        if m and m.group("operand") in loop_results:
-            found.append((i + 1, loop_results[m.group("operand")], m))
+        if not m:
+            continue
+        operand = m.group("operand")
+        best = None
+        for result_name, loop_line, body_end in loop_results:
+            if result_name != operand:
+                continue
+            if body_end > i + 1:  # loop must close at or before this cast
+                continue
+            if best is None or body_end > best[1]:
+                best = (loop_line, body_end)
+        if best is not None:
+            found.append((i + 1, best[0], m))
     return found
 
 

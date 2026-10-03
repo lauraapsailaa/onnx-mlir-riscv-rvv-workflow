@@ -50,7 +50,28 @@ def load_mnist_test_images(num_images, seed=0):
     return images
 
 
-def preprocess(images, mean, std, normalize=True, flatten=False):
+def load_cifar10_test_images(num_images, seed=0):
+    """
+    Load real CIFAR-10 test images via torchvision (downloads and caches
+    on first use), matching train_resnet20_cifar10.py's own data source.
+    Returns raw pixel values in [0, 255], shape (num_images, 3, 32, 32)
+    (channels-first, matching the model's actual input layout).
+    """
+    from torchvision import datasets
+    print("Fetching CIFAR-10 test data (cached after first run)...",
+          file=sys.stderr)
+    test_set = datasets.CIFAR10(root="./cifar10_data", train=False,
+                                download=True)
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(test_set), size=min(num_images, len(test_set)),
+                     replace=False)
+    # test_set.data is (N, 32, 32, 3) uint8, HWC -- transpose to (N, 3, 32, 32)
+    images = test_set.data[idx].astype(np.float32)
+    images = images.transpose(0, 3, 1, 2)  # NHWC -> NCHW
+    return images
+
+
+def preprocess_mnist(images, mean, std, normalize=True, flatten=False):
     """images: (N, 28, 28) raw pixel values in [0,255]."""
     x = images / 255.0
     if normalize:
@@ -59,6 +80,18 @@ def preprocess(images, mean, std, normalize=True, flatten=False):
     if flatten:
         return x.reshape(-1, 1, 784)
     return x.reshape(-1, 1, 1, 28, 28)
+
+
+def preprocess_cifar10(images, mean, std, normalize=True):
+    """images: (N, 3, 32, 32) raw pixel values in [0,255], channels-first."""
+    x = images / 255.0
+    if normalize:
+        # mean/std would need to be per-channel for a real CIFAR normalization
+        # scheme; --no-normalize (plain [0,1]) is what train_resnet20_cifar10.py
+        # actually uses, so that's the expected default for this dataset.
+        x = (x - mean) / std
+    x = x.astype(np.float32)
+    return x.reshape(-1, 1, 3, 32, 32)
 
 
 def expose_all_intermediate_outputs(model_path, exposed_model_path):
@@ -70,6 +103,19 @@ def expose_all_intermediate_outputs(model_path, exposed_model_path):
     model = onnx.load(model_path)
     model = onnx.shape_inference.infer_shapes(model)
 
+    # Look up each tensor's REAL inferred dtype (shape inference computes
+    # this) instead of assuming FLOAT for everything -- some intermediate
+    # tensors (e.g. Shape/ConstantOfShape/index computations) are
+    # genuinely int64 or another type, and onnxruntime will refuse to
+    # load a model where a declared output type doesn't match reality.
+    dtype_by_name = {}
+    for vi in model.graph.value_info:
+        dtype_by_name[vi.name] = vi.type.tensor_type.elem_type
+    for vi in model.graph.input:
+        dtype_by_name[vi.name] = vi.type.tensor_type.elem_type
+    for init in model.graph.initializer:
+        dtype_by_name[init.name] = init.data_type
+
     existing_output_names = {o.name for o in model.graph.output}
     exposed_names = []
 
@@ -79,8 +125,9 @@ def expose_all_intermediate_outputs(model_path, exposed_model_path):
             if out_name and out_name not in existing_output_names:
                 exposed_names.append(out_name)
                 existing_output_names.add(out_name)
+                elem_type = dtype_by_name.get(out_name, onnx.TensorProto.FLOAT)
                 value_info = onnx.helper.make_tensor_value_info(
-                    out_name, onnx.TensorProto.FLOAT, None)
+                    out_name, elem_type, None)
                 model.graph.output.append(value_info)
 
     onnx.save(model, exposed_model_path)
@@ -93,6 +140,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("model_path")
+    parser.add_argument("--dataset", choices=["mnist", "cifar10"], default="mnist",
+                         help="Which real test dataset to profile over (default: mnist)")
     parser.add_argument("--input-name", default="image")
     parser.add_argument("--num-images", type=int, default=200,
                          help="Number of real test images to profile over (default: 200)")
@@ -113,10 +162,15 @@ def main():
     exposed_model_path = "/tmp/_profiling_exposed_model.onnx"
     exposed_names = expose_all_intermediate_outputs(args.model_path, exposed_model_path)
 
-    print("Loading real MNIST test images...", file=sys.stderr)
-    images = load_mnist_test_images(args.num_images, seed=args.seed)
-    batch = preprocess(images, args.input_mean, args.input_std,
-                       normalize=not args.no_normalize, flatten=args.flatten)
+    print(f"Loading real {args.dataset.upper()} test images...", file=sys.stderr)
+    if args.dataset == "cifar10":
+        images = load_cifar10_test_images(args.num_images, seed=args.seed)
+        batch = preprocess_cifar10(images, args.input_mean, args.input_std,
+                                   normalize=not args.no_normalize)
+    else:
+        images = load_mnist_test_images(args.num_images, seed=args.seed)
+        batch = preprocess_mnist(images, args.input_mean, args.input_std,
+                                 normalize=not args.no_normalize, flatten=args.flatten)
     print(f"Profiling over {batch.shape[0]} image(s), "
           f"input range in this batch: [{batch.min():.4f}, {batch.max():.4f}]",
           file=sys.stderr)

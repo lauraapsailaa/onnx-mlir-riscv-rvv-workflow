@@ -101,8 +101,7 @@ def is_zero_constant_operand(operand_name, line_idx, lines, window=2000):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mlir_path")
     args = parser.parse_args()
 

@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-Insert TAFFO annotation calls (`func.call @set_range(...)`) into a pre-raised
-MLIR file, using exact min/max/precision bounds derived from the model's
-actual weight/bias data (see extract_ranges.py) and a chosen input range.
+Insert TAFFO annotation calls into a pre-raised MLIR file, using exact
+min/max/precision bounds derived from the model's actual weight/bias data
+(see extract_ranges.py) and a chosen input range.
 
---raise-to-taffo (TAFFO-MLIR's RaiseToTaffoPass.cpp, RewriteSetRangeCall)
-recognizes any func.call whose callee name contains "set_range" and converts
-it directly into a taffo.cast2real with the given min/max/precision operands.
-This script inserts such calls right after every memref.load/affine.load that
-reads from a matched krnl.global (weight/bias) or the model's input tensor.
+Annotations are emitted as a generic, unregistered "set_range"(...) op
+(NOT a func.call to a module-level declaration). --raise-to-taffo
+(TAFFO-MLIR's RaiseToTaffoPass.cpp, RewriteSetRangeGeneric) recognizes
+this by name and converts it directly into a taffo.cast2real with the
+given min/max/precision operands. The generic-op form (rather than
+func.call @set_range) is required for models using Conv: func.call's
+symbol resolution genuinely fails when the call is positioned inside a
+krnl.region (AffineScope) block, which Conv's lowering introduces --
+confirmed via isolated reproduction. A generic named op doesn't
+participate in symbol-table lookup at all, sidestepping the issue. This
+script inserts such annotations right after every memref.load/affine.load
+that reads from a matched krnl.global (weight/bias) or the model's input
+tensor.
 
 Weight/bias tensors are matched to krnl.global ops BY SHAPE (krnl.global does
 not preserve the original ONNX initializer name). If your model has two
@@ -176,6 +184,12 @@ def main():
                               "store/load round-trip through memory, since MLIR's dataflow "
                               "analysis tracks SSA values, not memory contents. Repeatable. "
                               "Example: --buffer-range '%%alloc_2:0.0,59.22'")
+    parser.add_argument("--precision", type=float, default=0.01,
+                         help="Precision/error term applied to --op-range, "
+                              "--accumulator-range, and --buffer-range entries "
+                              "(default: 0.01). Does not affect weight/bias "
+                              "annotations, which use their own exact precision "
+                              "from the ranges JSON (see extract_ranges.py).")
     args = parser.parse_args()
 
     with open(args.mlir_path) as f:
@@ -210,7 +224,7 @@ def main():
             line_str, bounds_str = spec.split(":", 1)
             min_str, max_str = bounds_str.split(",")
             line_no = int(line_str)
-            op_range_overrides[line_no] = (float(min_str), float(max_str), 0.01,
+            op_range_overrides[line_no] = (float(min_str), float(max_str), args.precision,
                                             f"line{line_no}")
         except ValueError:
             print(f"ERROR: could not parse --op-range spec {spec!r}, expected LINE:MIN,MAX",
@@ -227,7 +241,7 @@ def main():
     accumulator_range = None
     if args.accumulator_range:
         amin_s, amax_s = args.accumulator_range.split(",")
-        accumulator_range = (float(amin_s), float(amax_s), 0.01, "accumulator")
+        accumulator_range = (float(amin_s), float(amax_s), args.precision, "accumulator")
         print(f"Accumulator range (applied to all scalar accumulators): "
               f"[{accumulator_range[0]}, {accumulator_range[1]}]", file=sys.stderr)
     else:
@@ -239,7 +253,7 @@ def main():
         try:
             name, bounds_str = spec.split(":", 1)
             min_str, max_str = bounds_str.split(",")
-            buffer_ranges[name] = (float(min_str), float(max_str), 0.01, f"buffer{name}")
+            buffer_ranges[name] = (float(min_str), float(max_str), args.precision, f"buffer{name}")
         except ValueError:
             print(f"ERROR: could not parse --buffer-range spec {spec!r}, "
                   f"expected SSA_NAME:MIN,MAX", file=sys.stderr)
@@ -269,7 +283,7 @@ def main():
         out_lines.append(f'{indent}{max_v} = arith.constant {vmax!r} : f64')
         out_lines.append(f'{indent}{prec_v} = arith.constant {prec!r} : f64')
         out_lines.append(
-            f'{indent}{annotated_v} = func.call @set_range({result_name}, '
+            f'{indent}{annotated_v} = "set_range"({result_name}, '
             f'{min_v}, {max_v}, {prec_v}) : (f32, f64, f64, f64) -> f32  '
             f'// annotate {label}'
         )
@@ -325,16 +339,6 @@ def main():
                 op_kind = "arith.maxnumf" if mm else "math.exp"
                 print(f"  NOTE: line {line_no} ({op_kind}) has no --op-range override, "
                       f"leaving unannotated", file=sys.stderr)
-
-    decl = 'func.func private @set_range(f32, f64, f64, f64) -> f32'
-    inserted = False
-    for idx, l in enumerate(out_lines):
-        if l.strip().startswith("module"):
-            out_lines.insert(idx + 1, "  " + decl)
-            inserted = True
-            break
-    if not inserted:
-        out_lines.insert(0, decl)
 
     with open(args.output, "w") as f:
         f.write("\n".join(out_lines) + "\n")
