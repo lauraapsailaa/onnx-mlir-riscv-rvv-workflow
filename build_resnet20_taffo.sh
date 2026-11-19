@@ -159,14 +159,7 @@ echo "  Conv range:         [$CONV_MIN, $CONV_MAX]"
 echo "  Add (skip) range:   [$ADD_MIN, $ADD_MAX]"
 echo "  Logits range:       [$LOGITS_MIN, $LOGITS_MAX]"
 echo "  Accumulator (catch-all) range: [$ACCUMULATOR_MIN, $ACCUMULATOR_MAX]"
-# GlobalAveragePool's accumulator sums 64 spatial values BEFORE dividing
-# by 64 -- its true range during accumulation is up to ~64x wider than
-# the post-division GAP_MAX, and the same buffer is often reused for
-# both the accumulation and post-division phases (a single --buffer-range
-# applies uniformly to every load from that name), so this must be wide
-# enough to safely cover both. Confirmed as the root cause of severe
-# fixed-point saturation (values clipped at a hard ~0.5 ceiling) when the
-# narrower GAP_MIN/GAP_MAX was used for the accumulator directly.
+# GlobalAveragePool's accumulator sums 64 spatial values before dividing by 64 
 GAP_ACCUM_MAX=$(python3 -c "print(${GAP_MAX} * 64)")
 echo "  GAP accumulator (pre-division) range: [$GAP_MIN, $GAP_ACCUM_MAX]"
 echo ""
@@ -206,74 +199,7 @@ OP_RANGE_ARGS="$RELU_OP_RANGE_ARGS"
 OP_RANGE_ARGS="$OP_RANGE_ARGS --op-range ${LINE_SOFTMAX_MAX}:${LOGITS_MIN},${LOGITS_MAX}"
 OP_RANGE_ARGS="$OP_RANGE_ARGS --op-range ${LINE_SOFTMAX_EXP}:${SOFTMAX_EXP_MIN},${SOFTMAX_EXP_MAX}"
 
-# *** BUFFER_RANGES starts EMPTY -- discovered iteratively via crashes,
-# same process used for every prior model. When Step 5c crashes, use gdb
-# to trace the failing op's operand to an unannotated %allocN buffer,
-# determine its category from the surrounding MLIR (Relu/Conv/Add store),
-# add an entry here using the matching aggregate bound, and re-run.
-# Skip-connection identity-path buffers, found via:
-#   grep -B1 'builtin.unrealized_conversion_cast %107 : f32 to !taffo.real'
-#     resnet20_after_raise_patched.mlir | grep -oP 'affine\.load \K%alloc_\d+' | sort -u
-# One per residual block's Add (main path + identity path) -- these were
-# completely unannotated (a bare unrealized_conversion_cast, no bounds at
-# all), matching the "argRanges[1] inverted" crash exactly.
-# %alloc_42: the flattened, post-GlobalAveragePool buffer (shape 1x64)
-# feeding the final FC/Gemm layer's reduction loop -- found via the same
-# gdb trace, unannotated (bare unrealized_conversion_cast). Uses the GAP
-# aggregate bound, matching its actual source (GlobalAveragePool's output).
-# %50, %53, ..., %104: all 19 Pad-output buffers (one per Conv with
-# padding: 1 initial + 2 per residual block x 9 blocks). Found via the
-# shared structural pattern "unrealized_conversion_cast %X : tensor<...>
-# to memref<...>" -- insert_annotations.py's alias tracer only follows
-# memref.reinterpret_cast chains, but Pad's own lowering produces this
-# tensor-to-memref cast pattern instead, so none of these get picked up
-# automatically. %50 is the FIRST one (conv1's own padded input, derived
-# directly from the model's input image) -- uses the exact [0,1] input
-# range. The remaining 18 are all derived from a prior ReLU output --
-# use the aggregate PAD bound (a safe superset for any of them).
-# %alloc_14, %alloc_27: inputs to the two downsample 1x1 convs
-# (stage2.0, stage3.0) -- ReLU outputs feeding a downsample conv directly,
-# bypassing Pad entirely since 1x1 kernels need no padding, which is why
-# neither the earlier skip-connection-Add nor Pad-output searches caught
-# them. %alloc_43: the logits buffer's SECOND use, inside Softmax's
-# sum-of-exp loop (its first use, feeding arith.maxnumf directly on raw
-# f32, is already correctly handled via --op-range).
-# %alloc_44: the exp-value buffer, stored during Softmax's sum-of-exp
-# loop and read back later for the division step -- same buffer
-# read-back pattern seen for MNIST/wider_mlp's Softmax before.
-# %alloc_5, %alloc_9, ..., %alloc_40: the main-path conv output buffers
-# feeding each skip-connection Add -- the "other half" of the
-# %alloc_2/6/10/etc identity-path buffers fixed earlier. Raw conv output,
-# pre-Add, so uses CONV_MIN/CONV_MAX.
-# *** RESET TO EMPTY after adding --decompose-onnx (Step 2): Pad now
-# lowers to real krnl loops instead of an opaque tensor-to-memref bridge
-# cast, which shifted the entire file's buffer numbering and made every
-# previously-discovered %allocN name stale, and made the old %NN-style
-# Pad-bridge entries entirely obsolete (that idiom no longer exists).
-# Re-discovering iteratively via crashes, same process as before -- the
-# CATEGORIES to expect are already known (skip-connection identity/
-# main-path -> ADD/CONV, GlobalAveragePool output -> GAP, logits buffer,
-# Softmax exp-value buffer, downsample-conv inputs -> RELU), just the
-# specific %allocN names need re-finding.
-# Found via find_unannotated_buffers.py in one pass (post --decompose-onnx,
-# which fixed Pad's own lowering AND apparently let insert_annotations.py's
-# existing alias-tracing auto-detect most of what previously needed manual
-# discovery -- only 4 buffers remained unannotated this round, down from
-# dozens before).
-# %alloc_57: Pad's own memset+copy output buffer (init to constant, then
-#   copy from the unpadded source into offset positions).
-# %alloc_60: GlobalAveragePool's accumulator (init to 0, taffo.add loop,
-#   then divide by 64).
-# %alloc_62: the logits buffer (FC layer's bias-add result, pre-Softmax).
-# %alloc_63: Softmax's exp-value buffer (stored during sum loop, re-read
-#   during division).
-# 28 more found via find_unannotated_buffers.py (scope-collision bug
-# fixed), cleanly classified via pattern signal: Pad's offset-copy
-# structure (17), ReLU's arith.maxnumf (9), skip-connection Add (2).
-# %alloc (bare, no numeric suffix): conv1's own padded input buffer, the
-# very first Pad in the network, derived directly from the input image --
-# found via find_unannotated_buffers.py after fixing its regex to also
-# match this bare-name case (it previously only matched %alloc_N).
+
 BUFFER_MAP_SCRIPT=$SCRIPT_DIR/map_buffer_ranges.py
 PAD_BUFFERS=(%alloc %alloc_4 %alloc_7 %alloc_10 %alloc_13 %alloc_16 %alloc_19 %alloc_22 %alloc_25 %alloc_29 %alloc_32 %alloc_35 %alloc_38 %alloc_41 %alloc_44 %alloc_48 %alloc_51 %alloc_54 %alloc_57)
 PAD_BUFFER_RANGE_ARGS=$(python3 $BUFFER_MAP_SCRIPT $PROFILED_RANGES_JSON --pattern /Pad "${PAD_BUFFERS[@]}")
@@ -328,13 +254,7 @@ python3 $PATCH_SCRIPT $BUILD_DIR/resnet20_after_raise.mlir --list
 LOOP_LINES_RAW=($(python3 $PATCH_SCRIPT $BUILD_DIR/resnet20_after_raise.mlir --list 2>&1 \
   | sed -n '/problematic loop-RESULT cast/,/problematic loop-ENTRY/p' \
   | grep -oP 'declaring loop at line \K[0-9]+' | awk '!seen[$0]++'))
-# Keep only OUTERMOST declaring lines (via genuine nesting/brace-depth,
-# not trip count -- trip count alone is unreliable, since conv1's own
-# outermost loop has trip count 3 too, from its 3-channel RGB input,
-# same as the nested kh/kw levels of every OTHER conv layer). A conv
-# layer's 3x3 reduction has 3 nested affine.for levels;
-# patch_raised_casts.py's detection matches all of them, not just the
-# one that actually corresponds to one distinct conv layer.
+# Keep only outermost declaring lines
 DEDUPE_SCRIPT=$SCRIPT_DIR/dedupe_nested_loops.py
 LOOP_LINES=($(python3 $DEDUPE_SCRIPT $BUILD_DIR/resnet20_after_raise.mlir "${LOOP_LINES_RAW[@]}"))
 
@@ -349,9 +269,7 @@ CONV_MAP_SCRIPT=$SCRIPT_DIR/map_conv_accumulator_ranges.py
 NUM_LOOP_LINES=${#LOOP_LINES[@]}
 if [ "$NUM_LOOP_LINES" -ge 1 ]; then
   # The last 2 entries (if present) are Softmax's max-reduction and
-  # sum-of-exp loops (textually last in the file), NOT conv layers --
-  # exclude them from the conv-accumulator mapping, they get their own
-  # specific ranges below.
+  # sum-of-exp loops 
   if [ "$NUM_LOOP_LINES" -ge 2 ]; then
     CONV_LOOP_LINES=("${LOOP_LINES[@]:0:$((NUM_LOOP_LINES - 2))}")
   else
@@ -372,9 +290,7 @@ if [ "$NUM_LOOP_LINES" -ge 1 ]; then
   fi
 
   if [ "$NUM_LOOP_LINES" -ge 2 ]; then
-    # Softmax is textually last in the file, so its two loops (max-reduction,
-    # sum-of-exp) are always the LAST two entries -- override them with
-    # their specific, tighter ranges instead of the generic accumulator one.
+    # Softmax is textually last in the file
     MAXLOOP_IDX=$((NUM_LOOP_LINES - 2))
     SUMLOOP_IDX=$((NUM_LOOP_LINES - 1))
     SOFTMAX_MAXLOOP_LINE=${LOOP_LINES[$MAXLOOP_IDX]}
@@ -386,31 +302,14 @@ if [ "$NUM_LOOP_LINES" -ge 1 ]; then
 fi
 
 if [ "${#ENTRY_LOOP_LINES[@]}" -ge 1 ]; then
-  # Softmax's own sum-loop entry is textually LAST in the file (its 21
-  # conv-layer %arg11 siblings all come before it), so it's the last
-  # item here, not the first -- patch_raised_casts.py's own --list
-  # detection catches all 22 iter_arg loops (21 conv + 1 softmax)
-  # together, with no distinction between them at that stage.
+  # Softmax's own sum-loop entry is textually last in the file 
   LAST_IDX=$((${#ENTRY_LOOP_LINES[@]} - 1))
   SOFTMAX_SUMLOOP_LINE=${ENTRY_LOOP_LINES[$LAST_IDX]}
   echo "  Loop-ENTRY (iter_arg) cast at declaring line $SOFTMAX_SUMLOOP_LINE -> range [0.0, $SOFTMAX_SUM_MAX]"
   PATCH_ARGS="$PATCH_ARGS --iterarg-range ${SOFTMAX_SUMLOOP_LINE}:0.0,${SOFTMAX_SUM_MAX}"
 fi
 
-# Conv-layer accumulator entry casts: one per conv's reduction loop
-# (iter_arg-based, NOT the memref-based idiom RewriteMemAccumulator
-# targets -- this is TAFFO-MLIR's own affine.for iter_args reduction).
-# patch_raised_casts.py's own --list detection (built around Softmax's
-# specific structure) doesn't recognize this pattern at all -- found
-# instead via direct grep for the declaring affine.for line immediately
-# preceding an unannotated "unrealized_conversion_cast %argN : f32 to
-# !taffo.real" entry cast. Uses the same ACCUMULATOR catch-all bound as
-# every other scalar accumulator in this pipeline.
-# Computed dynamically, NOT hardcoded: the raised file's line numbers
-# shift every time an upstream annotation changes (since that changes
-# insert_annotations.py's output, which changes raise-to-taffo's output
-# structure too) -- a static snapshot goes stale the moment any other
-# BUFFER_RANGES/OP_RANGE entry is added or changed.
+# Conv-layer accumulator entry casts
 CONV_ITERARG_LINES=$(grep -n -B1 'builtin.unrealized_conversion_cast %arg11 : f32 to !taffo.real' \
   $BUILD_DIR/resnet20_after_raise.mlir \
   | grep 'affine.for' | grep -oP '^\d+')
@@ -510,6 +409,14 @@ fi
 mv $BUILD_DIR/resnet20_taffo_narrowed.mlir $BUILD_DIR/resnet20_taffo.mlir
 echo "Step 5d done -> $BUILD_DIR/resnet20_taffo.mlir (overwritten in place)"
 echo ""
+
+echo "Step 5e - integer activation buffers"
+cp $BUILD_DIR/resnet20_taffo.mlir $BUILD_DIR/resnet20_taffo_before_bufs.mlir
+#python3 ~/onnx-mlir/onnx-mlir/docs/python_scripts/narrow_buffers.py $BUILD_DIR/resnet20_taffo_before_bufs.mlir $BUILD_DIR/resnet20_taffo.mlir
+#python3 ~/onnx-mlir/onnx-mlir/docs/python_scripts/narrow_buffers.py   $BUILD_DIR/resnet20_taffo_before_bufs.mlir $BUILD_DIR/stage1.mlir
+python3 ~/onnx-mlir/onnx-mlir/docs/python_scripts/preconvert_weights.py $BUILD_DIR/resnet20_taffo_before_bufs.mlir $BUILD_DIR/resnet20_taffo.mlir -v
+#python3 ~/onnx-mlir/onnx-mlir/docs/python_scripts/fuse_rescale.py     $BUILD_DIR/stage2.mlir $BUILD_DIR/resnet20_taffo.mlir -v
+#python3 ~/onnx-mlir/onnx-mlir/docs/python_scripts/fuse_accum.py $BUILD_DIR/stage3.mlir $BUILD_DIR/resnet20_taffo.mlir -v
 
 # ============================================================
 # Step 6 - Lower to LLVM Dialect

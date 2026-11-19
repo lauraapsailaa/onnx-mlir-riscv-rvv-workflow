@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# build_mnist_riscv.sh
+# build_riscv_rvv_mnist.sh
 # ------------------------------------------------------------
 # Build script for compiling an ONNX MNIST model into a
 # RISC-V Vector Extension (RVV) shared library using
@@ -13,16 +13,19 @@
 #
 # Build pipeline:
 #   1. Generate MLIR/LLVM IR from ONNX using ONNX-MLIR
-#   2. Translate MLIR → LLVM IR
-#   3. Compile LLVM IR → RISC-V assembly using llc
+#   2. Translate MLIR -> LLVM IR, then optimize it with opt -O3
+#   3. Compile LLVM IR -> RISC-V assembly using llc
 #   4. Assemble into object code
 #   5. Compile ONNX-MLIR runtime support
 #   6. Link all objects into a shared library
-#   7. Build a standalone inference executable
+#   7. Build a standalone inference executable (statically linked)
 #
-# Final outputs:
+# All generated files are written to a dedicated BUILD_DIR, kept separate
+# from the plain and TAFFO build scripts' own output directories.
+#
+# Final outputs (inside BUILD_DIR):
 #   - mnist_riscv_rvv.so      (shared library)
-#   - mnist_riscv_rvv         (test executable)
+#   - mnist_riscv_rvv          (test executable)
 #
 # Requirements:
 #   - ONNX-MLIR installed
@@ -33,8 +36,8 @@
 #   - RVV-capable RISC-V target
 #
 # Example usage:
-#   chmod +x build_mnist_riscv.sh
-#   ./build_mnist_riscv.sh
+#   chmod +x build_riscv_rvv_mnist.sh
+#   ./build_riscv_rvv_mnist.sh
 # ------------------------------------------------------------
 
 # Exit immediately if any command fails.
@@ -45,8 +48,13 @@ set -e
 # Configuration Section
 # ============================================================
 
+MNIST_DIR=~/onnx-mlir/onnx-mlir/docs/mnist_example
+BUILD_DIR=$MNIST_DIR/mnist_rvv
+
+mkdir -p $BUILD_DIR
+
 # Path to the ONNX MNIST model.
-ONNX_MODEL=~/onnx-mlir/onnx-mlir/docs/mnist_example/mnist.onnx
+ONNX_MODEL=$MNIST_DIR/mnist.onnx
 
 # Path to ONNX-MLIR public headers.
 ONNX_MLIR_INCLUDE=~/onnx-mlir/onnx-mlir/include
@@ -63,6 +71,20 @@ RISCV_GCC=~/riscv-gnu-toolchain/riscv/bin/riscv64-unknown-linux-gnu-gcc
 # Name of the generated shared library.
 OUTPUT=mnist_riscv_rvv.so
 
+# Directory containing the driver source (mnist.cpp) -- same directory as
+# this script, independent of BUILD_DIR.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DRIVER_SRC=$SCRIPT_DIR/mnist.cpp
+
+echo "BUILD_DIR:  $BUILD_DIR"
+echo "DRIVER_SRC: $DRIVER_SRC"
+echo ""
+
+# Every subsequent command that writes output with a relative path will
+# now write into BUILD_DIR, not wherever the script happened to be invoked
+# from -- keeping this build fully self-contained.
+cd $BUILD_DIR
+
 # ============================================================
 # LLVM Backend Configuration
 # ============================================================
@@ -73,15 +95,6 @@ OUTPUT=mnist_riscv_rvv.so
 # This affects LLVM code generation.
 #
 export LLVM_TARGET_OPTIONS="-mattr=+v"
-
-# ============================================================
-# Cleanup Section
-# ============================================================
-
-# Remove previously generated object files and libraries.
-# Uncomment for clean rebuilds.
-#
-# rm -f *.o *.so
 
 # ============================================================
 # Step 1 - Generate LLVM IR from ONNX
@@ -106,7 +119,7 @@ echo "- Compiling ONNX model: "
 #   -Xllc "-mcpu=generic-rv64"
 #       Generic RV64 CPU target.
 #
-#   -Xllc "-mattr=+d,+v"
+#   -Xllc "-mattr=+d,+v,+m"
 #       Enable:
 #         +d = double-precision floating point
 #         +v = RISC-V Vector Extension
@@ -117,11 +130,10 @@ onnx-mlir $ONNX_MODEL \
   -o mnist_riscv_rvv \
   -Xllc "-march=riscv64" \
   -Xllc "-mcpu=generic-rv64" \
-  -Xllc "-mattr=+d,+v"
+  -Xllc "-mattr=+d,+v,+m"
 
 # Generated intermediate files may include:
 #   mnist_riscv_rvv.onnx.mlir
-#   mnist_riscv_rvv.ll
 
 # ============================================================
 # Step 2 - Translate MLIR to LLVM IR
@@ -136,6 +148,22 @@ mlir-translate \
   --mlir-to-llvmir \
   mnist_riscv_rvv.onnx.mlir \
   -o mnist_riscv_rvv.ll
+
+# ============================================================
+# Step 2b - Optimize LLVM IR with opt -O3
+# ============================================================
+
+# The loop vectorizer runs only in opt, not in llc, so without this
+# step no RVV vector code is generated from the loops.
+#
+# Output:
+#   mnist_riscv_rvv_opt.ll
+#
+opt -O3 \
+  -mtriple=riscv64-unknown-linux-gnu \
+  -mattr=+v,+d,+m \
+  -S mnist_riscv_rvv.ll \
+  -o mnist_riscv_rvv_opt.ll
 
 # ============================================================
 # Step 3 - Compile LLVM IR to RISC-V Assembly
@@ -160,9 +188,9 @@ mlir-translate \
 #
 llc \
   -march=riscv64 \
-  -mattr=+v,+d \
+  -mattr=+v,+d,+m \
   -relocation-model=pic \
-  mnist_riscv_rvv.ll \
+  mnist_riscv_rvv_opt.ll \
   -o mnist_riscv_rvv.s
 
 # ============================================================
@@ -208,13 +236,16 @@ echo "- Compiling runtime (C): "
 #   - Runtime memory management
 #   - Utility helper functions
 #
-$RISCV_GCC -c \
+riscv64-unknown-linux-gnu-gcc -c \
   $RUNTIME_DIR/*.c \
   $SUPPORT_DIR/*.c \
   -I $ONNX_MLIR_INCLUDE \
   -march=rv64gcv \
   -mabi=lp64d \
   -fPIC
+
+mkdir -p runtime_objs
+find . -maxdepth 1 -name '*.o' ! -name 'mnist_riscv_rvv.o' -exec mv {} runtime_objs/ \;
 
 # Example generated objects:
 #   OMTensor.o
@@ -226,17 +257,13 @@ $RISCV_GCC -c \
 
 echo "- Linking shared library: "
 
-# Link all generated object files into a shared library.
-#
-# Notes:
-#   -shared
-#       Produce a .so shared object.
-#
-#   *.o
-#       Include all object files in current directory.
-#
-$RISCV_GCC -shared \
-  *.o \
+# Link this run's model object plus this run's runtime objects only --
+# never a blind "*.o" glob, which could also pick up unrelated .o files
+# from the plain/TAFFO builds if they ever shared a directory (these
+# export the same symbol names, causing "multiple definition" link errors).
+riscv64-unknown-linux-gnu-gcc -shared \
+  mnist_riscv_rvv.o \
+  runtime_objs/*.o \
   -o $OUTPUT \
   -march=rv64gc \
   -mabi=lp64d
@@ -244,14 +271,14 @@ $RISCV_GCC -shared \
 echo "- Build complete: $OUTPUT"
 
 # ============================================================
-# Step 7 - Build Standalone Test Executable (optional)
+# Step 7 - Build Standalone Test Executable
 # ============================================================
 
-# Compile the MNIST inference test program and link it
-# against the generated shared library.
-#
-# This executable can be used to run inference directly
-# on the target RISC-V platform.
+# Link STATICALLY, directly against the object files -- NOT the .so. A
+# dynamically-linked executable bakes in the .so's absolute build-time
+# path, which the dynamic linker then looks for verbatim on the target
+# board (where it won't exist), causing "cannot open shared object file"
+# at runtime. A single self-contained static binary avoids this entirely.
 #
 # Compiler options:
 #
@@ -269,13 +296,13 @@ echo "- Build complete: $OUTPUT"
 #
 riscv64-unknown-linux-gnu-g++ \
   --std=c++11 -O3 \
-  mnist.cpp ./mnist_riscv_rvv.so \
+  $DRIVER_SRC \
+  mnist_riscv_rvv.o \
+  runtime_objs/*.o \
   -o mnist_riscv_rvv \
   -I $ONNX_MLIR_INCLUDE \
-  -I $ONNX_MLIR_BUILD_INCLUDE \
   -march=rv64gcv \
   -mabi=lp64d \
-  -fPIC
+  -static
 
-# Final generated executable:
-#   mnist_riscv_rvv
+echo "- Build complete: $BUILD_DIR/mnist_riscv_rvv"

@@ -16,13 +16,14 @@ ONNX_MLIR_OPT=~/onnx-mlir/onnx-mlir/build/Release/bin/onnx-mlir-opt
 TAFFO_OPT=~/onnx-mlir/TAFFO-MLIR/build_debug/bin/taffo-opt
 
 SCRIPT_DIR=~/onnx-mlir/onnx-mlir/docs/mnist_example
-EXTRACT_SCRIPT=$SCRIPT_DIR/extract_ranges.py
-INSERT_SCRIPT=$SCRIPT_DIR/insert_annotations.py
-COMPUTE_SCRIPT=$SCRIPT_DIR/compute_layer_ranges_n.py
-LOAD_PROFILED_SCRIPT=$SCRIPT_DIR/load_profiled_ranges_n.py
-CLASSIFY_SCRIPT=$SCRIPT_DIR/classify_ops.py
-PATCH_SCRIPT=$SCRIPT_DIR/patch_raised_casts.py
-PROFILE_SCRIPT=$SCRIPT_DIR/profile_ranges.py
+GENERAL_PYTHON_SCRIPTS_DIR=~/onnx-mlir/onnx-mlir/docs/python_scripts
+EXTRACT_SCRIPT=$GENERAL_PYTHON_SCRIPTS_DIR/extract_ranges.py
+INSERT_SCRIPT=$GENERAL_PYTHON_SCRIPTS_DIR/insert_annotations.py
+COMPUTE_SCRIPT=$GENERAL_PYTHON_SCRIPTS_DIR/compute_layer_ranges_n.py
+LOAD_PROFILED_SCRIPT=$GENERAL_PYTHON_SCRIPTS_DIR/load_profiled_ranges_n.py
+CLASSIFY_SCRIPT=$GENERAL_PYTHON_SCRIPTS_DIR/classify_ops.py
+PATCH_SCRIPT=$GENERAL_PYTHON_SCRIPTS_DIR/patch_raised_casts.py
+PROFILE_SCRIPT=$GENERAL_PYTHON_SCRIPTS_DIR/profile_ranges.py
 
 DRIVER_SRC=$WIDER_MLP_DIR/wider_mlp.cpp
 

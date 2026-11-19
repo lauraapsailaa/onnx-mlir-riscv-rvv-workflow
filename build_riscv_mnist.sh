@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# build_mnist_riscv.sh
+# build_riscv_mnist.sh
 # ------------------------------------------------------------
 # Build script for compiling an ONNX MNIST model into a
 # RISC-V shared library using ONNX-MLIR, LLVM, and the RISC-V GNU toolchain.
@@ -14,10 +14,14 @@
 #      using ONNX-MLIR.
 #   2. Compile the ONNX-MLIR runtime support sources.
 #   3. Link everything into a shared library (.so).
+#   4. Build a standalone test executable (statically linked).
 #
-# Result:
-#   - mnist_riscv.so	(shared library)
-#   - mnist_riscv	(test executable)
+# All generated files are written to a dedicated BUILD_DIR, kept separate
+# from the RVV and TAFFO build scripts' own output directories.
+#
+# Result (inside BUILD_DIR):
+#   - mnist_riscv.so    (shared library)
+#   - mnist_riscv        (test executable)
 #
 # Requirements:
 #   - ONNX-MLIR installed and available in PATH
@@ -28,8 +32,8 @@
 #   - A valid RISC-V Linux target environment
 #
 # Example usage:
-#   chmod +x build_mnist_riscv.sh
-#   ./build_mnist_riscv.sh
+#   chmod +x build_riscv_mnist.sh
+#   ./build_riscv_mnist.sh
 # ------------------------------------------------------------
 
 # Exit immediately if any command fails.
@@ -40,37 +44,42 @@ set -e
 # Configuration Section
 # ============================================================
 
+MNIST_DIR=~/onnx-mlir/onnx-mlir/docs/mnist_example
+BUILD_DIR=$MNIST_DIR/mnist_plain
+
+mkdir -p $BUILD_DIR
+
 # Path to the ONNX model to compile.
-# This example uses the MNIST model included in ONNX-MLIR docs.
-ONNX_MODEL=~/onnx-mlir/onnx-mlir/docs/mnist_example/mnist.onnx
+ONNX_MODEL=$MNIST_DIR/mnist.onnx
 
 # Path to ONNX-MLIR public header files.
-# Required when compiling runtime support code.
 ONNX_MLIR_INCLUDE=~/onnx-mlir/onnx-mlir/include
 
 # Path to ONNX-MLIR runtime source files.
-# These implement tensor management and runtime helpers.
 RUNTIME_DIR=~/onnx-mlir/onnx-mlir/riscv_build/src/Runtime
 
 # Path to ONNX-MLIR support library source files.
-# These provide additional low-level utility functions.
 SUPPORT_DIR=~/onnx-mlir/onnx-mlir/riscv_build/src/Support
 
 # RISC-V GCC cross-compiler executable.
-# Used for compiling and linking generated code.
 RISCV_GCC=~/riscv-gnu-toolchain/riscv/bin/riscv64-unknown-linux-gnu-gcc
 
 # Name of the final shared library output.
 OUTPUT=mnist_riscv.so
 
-# ============================================================
-# Cleanup Section
-# ============================================================
+# Directory containing the driver source (mnist.cpp) -- same directory as
+# this script, independent of BUILD_DIR.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DRIVER_SRC=$SCRIPT_DIR/mnist.cpp
 
-# Remove previously generated object files and shared libraries.
-# Uncomment if you want a clean rebuild every time.
-#
-# rm -f *.o *.so
+echo "BUILD_DIR:  $BUILD_DIR"
+echo "DRIVER_SRC: $DRIVER_SRC"
+echo ""
+
+# Every subsequent command that writes output with a relative path will
+# now write into BUILD_DIR, not wherever the script happened to be invoked
+# from -- keeping this build fully self-contained.
+cd $BUILD_DIR
 
 # ============================================================
 # Step 1 - Compile ONNX model with ONNX-MLIR
@@ -93,7 +102,7 @@ echo "- Compiling ONNX model:"
 #   -o mnist_riscv
 #       Output filename prefix.
 #
-#   -Xllc "-mattr=+d"
+#   -Xllc "-mattr=+d,+m"
 #       Enable the RISC-V double-precision floating-point extension.
 #
 onnx-mlir $ONNX_MODEL \
@@ -101,7 +110,8 @@ onnx-mlir $ONNX_MODEL \
   -O3 \
   --EmitObj \
   -o mnist_riscv \
-  -Xllc "-mattr=+d"
+  -Xllc "-mattr=+d" \
+  -Xllc "-mattr=+m"
 
 # Output generated:
 #   mnist_riscv.o
@@ -114,10 +124,6 @@ echo "- Compiling runtime (C):"
 
 # Compile runtime and support C source files into object files.
 #
-# Runtime files are required because the generated ONNX model
-# depends on tensor/runtime helper functions provided by
-# ONNX-MLIR.
-#
 # Compiler options:
 #   -c
 #       Compile only (do not link yet).
@@ -126,26 +132,24 @@ echo "- Compiling runtime (C):"
 #       Add include directory for ONNX-MLIR headers.
 #
 #   -march=rv64gc
-#       Target RISC-V ISA:
-#         rv64  = 64-bit RISC-V
-#         g     = general-purpose ISA extensions
-#         c     = compressed instruction extension
+#       Target RISC-V ISA: rv64 = 64-bit RISC-V, g = general-purpose ISA
+#       extensions, c = compressed instruction extension.
 #
 #   -mabi=lp64d
-#       ABI using:
-#         lp64 = 64-bit long/pointer
-#         d    = double-precision floating point ABI
+#       ABI using: lp64 = 64-bit long/pointer, d = double-precision
+#       floating point ABI.
 #
 #   -fPIC
-#       Generate position-independent code required for
-#       shared libraries.The future of building 
+#       Generate position-independent code required for shared libraries.
 #
+mkdir -p runtime_objs
 $RISCV_GCC -c \
   $RUNTIME_DIR/*.c \
   $SUPPORT_DIR/*.c \
   -I $ONNX_MLIR_INCLUDE \
   -march=rv64gc -mabi=lp64d \
   -fPIC
+find . -maxdepth 1 -name '*.o' ! -name 'mnist_riscv.o' -exec mv {} runtime_objs/ \;
 
 # Example generated object files:
 #   OMTensor.o
@@ -157,25 +161,40 @@ $RISCV_GCC -c \
 
 echo "- Linking shared library:"
 
-# Link all object files into a shared library.
-#
-# Options:
-#   -shared
-#       Produce a shared object (.so).
-#
-#   *.o
-#       Include all object files generated previously.
-#
-#   -o $OUTPUT
-#       Name of the final shared library.
-#
+# Link this run's model object plus this run's runtime objects only --
+# never a blind "*.o" glob, which could also pick up unrelated .o files
+# from the RVV/TAFFO builds if they ever shared a directory (these export
+# the same symbol names, causing "multiple definition" link errors).
 $RISCV_GCC -shared \
-  *.o \
+  mnist_riscv.o \
+  runtime_objs/*.o \
   -o $OUTPUT \
   -march=rv64gc -mabi=lp64d
+
+# ============================================================
+# Step 4 - Build Standalone Test Executable
+# ============================================================
+
+echo "- Building test executable:"
+
+# Link STATICALLY, directly against the object files -- NOT the .so. A
+# dynamically-linked executable bakes in the .so's absolute build-time
+# path, which the dynamic linker then looks for verbatim on the target
+# board (where it won't exist), causing "cannot open shared object file"
+# at runtime. A single self-contained static binary avoids this entirely.
+riscv64-unknown-linux-gnu-g++ \
+  --std=c++11 -O3 \
+  $DRIVER_SRC \
+  mnist_riscv.o \
+  runtime_objs/*.o \
+  -o mnist_riscv \
+  -I $ONNX_MLIR_INCLUDE \
+  -march=rv64gc \
+  -mabi=lp64d \
+  -static
 
 # ============================================================
 # Build Complete
 # ============================================================
 
-echo "- Build complete: $OUTPUT"
+echo "- Build complete: $BUILD_DIR/$OUTPUT, $BUILD_DIR/mnist_riscv"
